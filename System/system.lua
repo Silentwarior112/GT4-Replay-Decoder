@@ -1,0 +1,1 @@
+dofile("GT4ReplayCrypto/file_handler.lua")
