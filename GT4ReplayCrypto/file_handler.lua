@@ -543,7 +543,7 @@ end
 local function drawModeScreen()
     local mode = currentMode()
 
-    drawText(20, 18, 0.8, "GT4 Replay Batch Tool", WHITE)
+    drawText(20, 18, 0.8, "GT4 Replay Tool", WHITE)
     drawText(20, 42, 0.6, "Choose operation", CYAN)
 
     local y = 86
@@ -567,7 +567,7 @@ local function drawFolderScreen()
     local outputDir = getOutputFolderForMode(browserPath, mode)
     local fileCount = countFilesInDirectory(browserPath)
 
-    drawText(20, 18, 0.8, "GT4 Replay Batch Tool", WHITE)
+    drawText(20, 18, 0.8, "GT4 Replay Tool", WHITE)
     drawText(20, 42, 0.55, "Mode: " .. mode.label, CYAN)
     drawText(20, 64, 0.45, "Current folder: " .. browserPath, GRAY)
     drawText(20, 84, 0.45, "Files to process: " .. tostring(fileCount), GRAY)
@@ -598,7 +598,7 @@ local function drawRunScreen()
         current = math.min(batchState.index, total)
     end
 
-    drawText(20, 18, 0.8, "GT4 Replay Batch Tool", WHITE)
+    drawText(20, 18, 0.8, "GT4 Replay Tool", WHITE)
     drawText(20, 42, 0.55, "Running: " .. tostring(batchState and batchState.mode.label or ""), CYAN)
     drawText(20, 66, 0.45, "Input: " .. tostring(batchState and batchState.inputDir or ""), GRAY)
     drawText(20, 86, 0.45, "Output: " .. tostring(batchState and batchState.outputDir or ""), YELLOW)
