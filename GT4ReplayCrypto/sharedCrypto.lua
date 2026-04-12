@@ -130,6 +130,39 @@ function SharedCrypto.GT4MC_easyDecrypt(bytes, startIndex, len, rand, seed, useO
     return seed
 end
 
+function SharedCrypto.GT4MC_easyEncrypt(bytes, startIndex, len, rand, seed, useOld)
+    local pos = 0
+    local index = startIndex
+
+    while pos + 4 <= len do
+        local value = read_u32_le(bytes, index)
+        local pseudoRandVal = rand:getInt32()
+        local newSeed, updated = SharedCrypto.RandomUpdateOld1(seed, useOld)
+        seed = newSeed
+
+        local result = u32((value ~ pseudoRandVal) - updated)
+        write_u32_le(bytes, index, result)
+
+        pos = pos + 4
+        index = index + 4
+    end
+
+    while pos < len do
+        local value = bytes[index]
+        local pseudoRandVal = rand:getInt32()
+        local newSeed, updated = SharedCrypto.RandomUpdateOld1(seed, useOld)
+        seed = newSeed
+
+        local result = u32((value ~ pseudoRandVal) - updated)
+        bytes[index] = result & 0xFF
+
+        pos = pos + 1
+        index = index + 1
+    end
+
+    return seed
+end
+
 function SharedCrypto.EncryptUnit_Decrypt(bytes, length, crcSeed, mult1, mult2, useMt, bigEndian, randomUpdateOld1_OldVersion)
     if bigEndian then
         return -1, "Big-endian decrypt is not implemented in this Lua port."
@@ -166,7 +199,43 @@ function SharedCrypto.EncryptUnit_Decrypt(bytes, length, crcSeed, mult1, mult2, 
         return actualDataSize
     end
 
-    return -1, string.format("[v4] CRC check failed. stored=%08X calculated=%08X rand=%08X dataCrc=%08X startCipher=%08X swap1=%d swap2=%d", storedCrc, calculatedCrc, cryptoRand, dataCrc, startCipher, swapOffset1 or -1, swapOffset2 or -1)
+    return -1, string.format("[v5] CRC check failed. stored=%08X calculated=%08X rand=%08X dataCrc=%08X startCipher=%08X swap1=%d swap2=%d", storedCrc, calculatedCrc, cryptoRand, dataCrc, startCipher, swapOffset1 or -1, swapOffset2 or -1)
+end
+
+function SharedCrypto.EncryptUnit_Encrypt(bytes, length, crcSeed, mult1, mult2, useMt, bigEndian, randomUpdateOld1_OldVersion, randVal)
+    if bigEndian then
+        return false, "Big-endian encrypt is not implemented in this Lua port."
+    end
+
+    if length < 8 then
+        return false, "Buffer too small."
+    end
+
+    if useMt then
+        return false, "MT pre-processing is not implemented in this encrypt path."
+    end
+
+    local actualDataSize = length - 8
+    local dataCrc = u32(CRC32.crc32_0x77073096(bytes, 9, actualDataSize) ~ (crcSeed or 0))
+    local headerRand = u32(randVal or 0x12345678)
+
+    write_u32_le(bytes, 1, headerRand)
+    write_u32_le(bytes, 5, dataCrc)
+
+    local rand = MTRandom.new(u32(dataCrc + headerRand))
+    local startCipher = u32(dataCrc ~ headerRand)
+    SharedCrypto.GT4MC_easyEncrypt(bytes, 9, actualDataSize, rand, startCipher, randomUpdateOld1_OldVersion)
+
+    local swapOffset1 = SharedCrypto.GT4MC_swapPlace(bytes, 5, length - 4, 4, mult1)
+    local swapOffset2 = SharedCrypto.GT4MC_swapPlace(bytes, 1, length, 4, mult2)
+
+    return true, {
+        rand = headerRand,
+        dataCrc = dataCrc,
+        startCipher = startCipher,
+        swap1 = swapOffset1,
+        swap2 = swapOffset2,
+    }
 end
 
 return SharedCrypto

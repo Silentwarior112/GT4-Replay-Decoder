@@ -31,12 +31,43 @@ local function read_u16_le(bytes, index)
     return (bytes[index] | (bytes[index + 1] << 8)) & 0xFFFF
 end
 
+local function bytes_from_string(input)
+    local bytes = {}
+    for i = 1, #input do
+        bytes[i] = string.byte(input, i)
+    end
+    return bytes
+end
+
+local function string_from_bytes(bytes, startIndex)
+    local startAt = startIndex or 1
+    local parts = {}
+    local chunkSize = 4096
+    for chunkStart = startAt, #bytes, chunkSize do
+        local chunk = {}
+        local lastIndex = math.min(chunkStart + chunkSize - 1, #bytes)
+        for i = chunkStart, lastIndex do
+            chunk[#chunk + 1] = string.char(bytes[i])
+        end
+        parts[#parts + 1] = table.concat(chunk)
+    end
+    return table.concat(parts)
+end
+
+local function clone_bytes(bytes)
+    local copy = {}
+    for i = 1, #bytes do
+        copy[i] = bytes[i]
+    end
+    return copy
+end
+
 local function u32_to_float(value)
-    return (string.unpack("<f", string.pack("<I4", u32(value))))
+    return string.unpack("<f", string.pack("<I4", u32(value)))
 end
 
 local function float_to_u32(value)
-    return (string.unpack("<I4", string.pack("<f", value)))
+    return string.unpack("<I4", string.pack("<f", value))
 end
 
 GT4ReplayCrypto.Mult1 = f32(0.22973239)
@@ -113,7 +144,87 @@ GT4ReplayCrypto.ShufTable = {
     0x3F, 0xBF, 0x7F, 0xFF,
 }
 
-function GT4ReplayCrypto.CRC32_PS2_Float(bytes, startIndex, length, crc)
+function GT4ReplayCrypto.parseSerializeHeader(bytes, startIndex)
+    local base = startIndex or 1
+    if #bytes < base + 0x0F then
+        return nil, "Replay is too small to contain the serialize header."
+    end
+
+    local headerSize = read_i32_le(bytes, base)
+    local dataSize = read_u32_le(bytes, base + 0x04)
+    local minorVersion = read_u16_le(bytes, base + 0x08)
+    local majorVersion = read_u16_le(bytes, base + 0x0A)
+    local encodeParam = read_u32_le(bytes, base + 0x0C)
+
+    if headerSize < 0x10 then
+        return nil, string.format("Invalid serialize header size: %d", headerSize)
+    end
+
+    local dataIndex = base + headerSize
+    local dataEnd = dataIndex + dataSize - 1
+
+    if dataIndex < 1 or dataIndex > (#bytes + 1) then
+        return nil, "Serialize data start is out of bounds."
+    end
+
+    if dataSize > 0 and dataEnd > #bytes then
+        return nil, "Serialize data length is out of bounds."
+    end
+
+    return {
+        header_size = headerSize,
+        data_size = dataSize,
+        minor_version = minorVersion,
+        major_version = majorVersion,
+        encode_param = encodeParam,
+        data_index = dataIndex,
+        data_end = dataEnd,
+        start_index = base,
+    }
+end
+
+function GT4ReplayCrypto.hasSerializeHeader(bytes, startIndex)
+    local info = GT4ReplayCrypto.parseSerializeHeader(bytes, startIndex)
+    if not info then
+        return false
+    end
+
+    if info.header_size ~= 0x40 then
+        return false
+    end
+
+    if info.major_version ~= 4 and info.major_version ~= 5 then
+        return false
+    end
+
+    return true
+end
+
+function GT4ReplayCrypto.inspectLayout(bytes)
+    if GT4ReplayCrypto.hasSerializeHeader(bytes, 1) then
+        return {
+            layout = "serialize_only",
+            serialize_index = 1,
+            has_outer_header = false,
+        }
+    end
+
+    if GT4ReplayCrypto.hasSerializeHeader(bytes, 9) then
+        return {
+            layout = "decrypted_wrapped",
+            serialize_index = 9,
+            has_outer_header = true,
+        }
+    end
+
+    return {
+        layout = "encrypted_wrapped",
+        serialize_index = nil,
+        has_outer_header = true,
+    }
+end
+
+function GT4ReplayCrypto.CRC32_PS2_Float_Decrypt(bytes, startIndex, length, crc)
     local currentFloat = u32_to_float((crc & 0x00FFFFFF) | 0x3F000000)
 
     for i = 0, length - 1 do
@@ -139,7 +250,80 @@ function GT4ReplayCrypto.CRC32_PS2_Float(bytes, startIndex, length, crc)
     end
 end
 
-function GT4ReplayCrypto.decryptReplayBytes(bytes)
+function GT4ReplayCrypto.CRC32_PS2_Float_Encrypt(bytes, startIndex, length, crc)
+    local currentFloat = u32_to_float((crc & 0x00FFFFFF) | 0x3F000000)
+
+    for i = 0, length - 1 do
+        local currentVal = float_to_u32(currentFloat)
+        local plainByte = bytes[startIndex + i]
+        local outByte = (
+            plainByte
+            ~ ((currentVal >> 16) & 0xFF)
+            ~ ((currentVal >> 8) & 0xFF)
+            ~ (currentVal & 0xFF)
+        ) & 0xFF
+
+        bytes[startIndex + i] = outByte
+
+        local denominatorBits = u32(
+            (GT4ReplayCrypto.ShufTable[(currentVal & 0xFF) + 1] << 16)
+            | (GT4ReplayCrypto.ShufTable[((currentVal >> 8) & 0xFF) + 1] << 8)
+            | GT4ReplayCrypto.ShufTable[((currentVal >> 16) & 0xFF) + 1]
+            | 0x3F000000
+        )
+
+        local numerator = f32(f32(GT4ReplayCrypto.FloatTable[outByte + 1]) * f32(currentFloat))
+        currentFloat = f32(numerator / u32_to_float(denominatorBits))
+    end
+end
+
+function GT4ReplayCrypto.decryptSerializeBytes(bytes, startIndex)
+    local info, err = GT4ReplayCrypto.parseSerializeHeader(bytes, startIndex)
+    if not info then
+        return false, err
+    end
+
+    GT4ReplayCrypto.CRC32_PS2_Float_Decrypt(bytes, info.data_index, info.data_size, info.encode_param)
+    return true, info
+end
+
+function GT4ReplayCrypto.encryptSerializeBytes(bytes, startIndex)
+    local info, err = GT4ReplayCrypto.parseSerializeHeader(bytes, startIndex)
+    if not info then
+        return false, err
+    end
+
+    GT4ReplayCrypto.CRC32_PS2_Float_Encrypt(bytes, info.data_index, info.data_size, info.encode_param)
+    return true, info
+end
+
+function GT4ReplayCrypto.decryptReplayBytesAuto(bytes)
+    local initialLayout = GT4ReplayCrypto.inspectLayout(bytes)
+
+    if initialLayout.layout == "serialize_only" then
+        local ok, infoOrErr = GT4ReplayCrypto.decryptSerializeBytes(bytes, 1)
+        if not ok then
+            return false, infoOrErr
+        end
+        return true, {
+            input_layout = initialLayout.layout,
+            output_layout = "serialize_only",
+            serialize = infoOrErr,
+        }, bytes
+    end
+
+    if initialLayout.layout == "decrypted_wrapped" then
+        local ok, infoOrErr = GT4ReplayCrypto.decryptSerializeBytes(bytes, 9)
+        if not ok then
+            return false, infoOrErr
+        end
+        return true, {
+            input_layout = initialLayout.layout,
+            output_layout = "decrypted_wrapped",
+            serialize = infoOrErr,
+        }, bytes
+    end
+
     local result, err = SharedCrypto.EncryptUnit_Decrypt(
         bytes,
         #bytes,
@@ -155,66 +339,276 @@ function GT4ReplayCrypto.decryptReplayBytes(bytes)
         return false, err or "EncryptUnit_Decrypt failed."
     end
 
-    if #bytes < 0x18 then
-        return false, "Replay is too small to contain the serialize header."
+    local postLayout = GT4ReplayCrypto.inspectLayout(bytes)
+    if postLayout.layout ~= "decrypted_wrapped" then
+        return false, "Replay decrypted but the serialize header was not found at offset 0x08."
     end
 
-    local serializeHeaderIndex = 0x08 + 1
-    local headerSize = read_i32_le(bytes, serializeHeaderIndex)
-    local dataSize = read_u32_le(bytes, serializeHeaderIndex + 0x04)
-    local minorVersion = read_u16_le(bytes, serializeHeaderIndex + 0x08)
-    local majorVersion = read_u16_le(bytes, serializeHeaderIndex + 0x0A)
-    local encodeParam = read_u32_le(bytes, serializeHeaderIndex + 0x0C)
-
-    if headerSize < 0x10 then
-        return false, string.format("Invalid serialize header size: %d", headerSize)
+    local ok, infoOrErr = GT4ReplayCrypto.decryptSerializeBytes(bytes, 9)
+    if not ok then
+        return false, infoOrErr
     end
-
-    local dataIndex = serializeHeaderIndex + headerSize
-    local dataEnd = dataIndex + dataSize - 1
-
-    if dataIndex < 1 or dataIndex > (#bytes + 1) then
-        return false, "Serialize data start is out of bounds."
-    end
-
-    if dataSize > 0 and dataEnd > #bytes then
-        return false, "Serialize data length is out of bounds."
-    end
-
-    GT4ReplayCrypto.CRC32_PS2_Float(bytes, dataIndex, dataSize, encodeParam)
 
     return true, {
-        header_size = headerSize,
-        data_size = dataSize,
-        minor_version = minorVersion,
-        major_version = majorVersion,
-        encode_param = encodeParam,
-    }
+        input_layout = initialLayout.layout,
+        output_layout = "decrypted_wrapped",
+        serialize = infoOrErr,
+    }, bytes
 end
 
-function GT4ReplayCrypto.decryptReplayString(inputData)
-    local bytes = {}
-    for i = 1, #inputData do
-        bytes[i] = string.byte(inputData, i)
+function GT4ReplayCrypto.encryptReplayBytesAuto(bytes, randVal)
+    local layout = GT4ReplayCrypto.inspectLayout(bytes)
+    local working = clone_bytes(bytes)
+
+    if layout.layout == "serialize_only" then
+        local ok, serializeInfoOrErr = GT4ReplayCrypto.encryptSerializeBytes(working, 1)
+        if not ok then
+            return false, serializeInfoOrErr
+        end
+
+        local wrapped = {}
+        for i = 1, 8 do
+            wrapped[i] = 0
+        end
+        for i = 1, #working do
+            wrapped[8 + i] = working[i]
+        end
+
+        local cryptoOk, cryptoInfoOrErr = SharedCrypto.EncryptUnit_Encrypt(
+            wrapped,
+            #wrapped,
+            0,
+            GT4ReplayCrypto.Mult1,
+            GT4ReplayCrypto.Mult2,
+            false,
+            false,
+            false,
+            randVal
+        )
+
+        if not cryptoOk then
+            return false, cryptoInfoOrErr
+        end
+
+        return true, {
+            input_layout = layout.layout,
+            output_layout = "encrypted_wrapped",
+            serialize = serializeInfoOrErr,
+            crypto = cryptoInfoOrErr,
+        }, wrapped
     end
 
-    local ok, infoOrErr = GT4ReplayCrypto.decryptReplayBytes(bytes)
+    if layout.layout == "decrypted_wrapped" then
+        local ok, serializeInfoOrErr = GT4ReplayCrypto.encryptSerializeBytes(working, 9)
+        if not ok then
+            return false, serializeInfoOrErr
+        end
+
+        local cryptoOk, cryptoInfoOrErr = SharedCrypto.EncryptUnit_Encrypt(
+            working,
+            #working,
+            0,
+            GT4ReplayCrypto.Mult1,
+            GT4ReplayCrypto.Mult2,
+            false,
+            false,
+            false,
+            randVal
+        )
+
+        if not cryptoOk then
+            return false, cryptoInfoOrErr
+        end
+
+        return true, {
+            input_layout = layout.layout,
+            output_layout = "encrypted_wrapped",
+            serialize = serializeInfoOrErr,
+            crypto = cryptoInfoOrErr,
+        }, working
+    end
+
+    return false, "Input already looks like an encrypted wrapped replay. Use the decoder instead."
+end
+
+function GT4ReplayCrypto.decryptReplayString(inputData, outputMode)
+    local bytes = bytes_from_string(inputData)
+    local ok, infoOrErr, outputBytes = GT4ReplayCrypto.decryptReplayBytesAuto(bytes)
     if not ok then
         return nil, nil, infoOrErr
     end
 
-    local parts = {}
-    local chunkSize = 4096
-    for startIndex = 1, #bytes, chunkSize do
-        local chunk = {}
-        local lastIndex = math.min(startIndex + chunkSize - 1, #bytes)
-        for i = startIndex, lastIndex do
-            chunk[#chunk + 1] = string.char(bytes[i])
+    if outputMode == "payload_only" then
+        local serializeIndex = 1
+        if infoOrErr.output_layout == "decrypted_wrapped" then
+            serializeIndex = 9
         end
-        parts[#parts + 1] = table.concat(chunk)
+
+        local serializeInfo, err = GT4ReplayCrypto.parseSerializeHeader(outputBytes, serializeIndex)
+        if not serializeInfo then
+            return nil, nil, err
+        end
+
+        return string_from_bytes(outputBytes, serializeInfo.data_index), {
+            input_layout = infoOrErr.input_layout,
+            output_layout = "payload_only",
+            serialize = serializeInfo,
+        }, nil
     end
 
-    return table.concat(parts), infoOrErr, nil
+    local startIndex = 1
+    if outputMode == "serialize_only" and infoOrErr.output_layout == "decrypted_wrapped" then
+        startIndex = 9
+    end
+
+    return string_from_bytes(outputBytes, startIndex), infoOrErr, nil
+end
+
+
+function GT4ReplayCrypto.makeDemoWrappedReplayBytes(bytes, randVal)
+    local working = clone_bytes(bytes)
+
+    local ok, encInfoOrErr, encryptedBytes = GT4ReplayCrypto.encryptReplayBytesAuto(working, randVal)
+    if not ok then
+        return false, encInfoOrErr
+    end
+
+    local ok2, decInfoOrErr, decryptedBytes = GT4ReplayCrypto.decryptReplayBytesAuto(clone_bytes(encryptedBytes))
+    if not ok2 then
+        return false, decInfoOrErr
+    end
+
+    return true, {
+        input_layout = encInfoOrErr.input_layout,
+        output_layout = "demo_wrapped",
+        encrypted = encInfoOrErr,
+        decrypted = decInfoOrErr,
+        serialize = decInfoOrErr.serialize,
+        crypto = encInfoOrErr.crypto,
+    }, decryptedBytes
+end
+
+function GT4ReplayCrypto.makeDemoWrappedReplayString(inputData, randVal)
+    local bytes = bytes_from_string(inputData)
+    local ok, infoOrErr, wrapped = GT4ReplayCrypto.makeDemoWrappedReplayBytes(bytes, randVal)
+    if not ok then
+        return nil, nil, infoOrErr
+    end
+
+    return string_from_bytes(wrapped), infoOrErr, nil
+end
+
+function GT4ReplayCrypto.encryptDecryptedReplayString(inputData, randVal)
+    local bytes = bytes_from_string(inputData)
+    local ok, infoOrErr, wrapped = GT4ReplayCrypto.encryptReplayBytesAuto(bytes, randVal)
+    if not ok then
+        return nil, nil, infoOrErr
+    end
+
+    return string_from_bytes(wrapped), infoOrErr, nil
+end
+
+
+function GT4ReplayCrypto.makeReplayPayloadBytes(bytes)
+    local layout = GT4ReplayCrypto.inspectLayout(bytes)
+    local working = clone_bytes(bytes)
+
+    if layout.layout == "serialize_only" then
+        local ok, serializeInfoOrErr = GT4ReplayCrypto.encryptSerializeBytes(working, 1)
+        if not ok then
+            return false, serializeInfoOrErr
+        end
+
+        local payload = {}
+        for i = serializeInfoOrErr.data_index, serializeInfoOrErr.data_end do
+            payload[#payload + 1] = working[i]
+        end
+
+        return true, {
+            input_layout = layout.layout,
+            output_layout = "replay_payload",
+            serialize = serializeInfoOrErr,
+        }, payload
+    end
+
+    if layout.layout == "decrypted_wrapped" then
+        local ok, serializeInfoOrErr = GT4ReplayCrypto.encryptSerializeBytes(working, 9)
+        if not ok then
+            return false, serializeInfoOrErr
+        end
+
+        local payload = {}
+        for i = serializeInfoOrErr.data_index, serializeInfoOrErr.data_end do
+            payload[#payload + 1] = working[i]
+        end
+
+        return true, {
+            input_layout = layout.layout,
+            output_layout = "replay_payload",
+            serialize = serializeInfoOrErr,
+        }, payload
+    end
+
+    return false, "Input looks like an encrypted wrapped replay. Decrypt it first, then build the replay payload."
+end
+
+function GT4ReplayCrypto.makeReplayPayloadString(inputData)
+    local bytes = bytes_from_string(inputData)
+    local ok, infoOrErr, outputBytes = GT4ReplayCrypto.makeReplayPayloadBytes(bytes)
+    if not ok then
+        return nil, nil, infoOrErr
+    end
+
+    return string_from_bytes(outputBytes), infoOrErr, nil
+end
+
+
+function GT4ReplayCrypto.makeDemoSerializeReplayBytes(bytes)
+    local layout = GT4ReplayCrypto.inspectLayout(bytes)
+    local working = clone_bytes(bytes)
+
+    if layout.layout == "serialize_only" then
+        local ok, serializeInfoOrErr = GT4ReplayCrypto.encryptSerializeBytes(working, 1)
+        if not ok then
+            return false, serializeInfoOrErr
+        end
+
+        return true, {
+            input_layout = layout.layout,
+            output_layout = "demo_serialize",
+            serialize = serializeInfoOrErr,
+        }, working
+    end
+
+    if layout.layout == "decrypted_wrapped" then
+        local ok, serializeInfoOrErr = GT4ReplayCrypto.encryptSerializeBytes(working, 9)
+        if not ok then
+            return false, serializeInfoOrErr
+        end
+
+        local stripped = {}
+        for i = 9, #working do
+            stripped[#stripped + 1] = working[i]
+        end
+
+        return true, {
+            input_layout = layout.layout,
+            output_layout = "demo_serialize",
+            serialize = serializeInfoOrErr,
+        }, stripped
+    end
+
+    return false, "Input looks like an encrypted wrapped replay. Decrypt it first, then build the demo serialize replay."
+end
+
+function GT4ReplayCrypto.makeDemoSerializeReplayString(inputData)
+    local bytes = bytes_from_string(inputData)
+    local ok, infoOrErr, outputBytes = GT4ReplayCrypto.makeDemoSerializeReplayBytes(bytes)
+    if not ok then
+        return nil, nil, infoOrErr
+    end
+
+    return string_from_bytes(outputBytes), infoOrErr, nil
 end
 
 return GT4ReplayCrypto

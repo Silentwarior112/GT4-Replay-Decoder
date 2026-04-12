@@ -21,42 +21,66 @@ local GRAY   = Color.new(170, 170, 170)
 local GREEN  = Color.new(80, 255, 120)
 local RED    = Color.new(255, 90, 90)
 local YELLOW = Color.new(255, 220, 80)
+local CYAN   = Color.new(120, 220, 255)
+local BG     = Color.new(18, 24, 40)
+local PANEL  = Color.new(28, 36, 58)
 
-local STAGE_SELECT_INPUT  = 1
-local STAGE_SELECT_OUTPUT = 2
-local STAGE_DONE          = 3
+local STATE_MODE   = 1
+local STATE_FOLDER = 2
+local STATE_RUN    = 3
+local STATE_DONE   = 4
 
-local stage = STAGE_SELECT_INPUT
-local selectedInputFile = nil
-local selectedOutputDir = nil
-local statusMessage = "Select an input file."
-
+local state = STATE_MODE
 local previousPad = 0
-local cursorIndex = 1
-local currentEntries = {}
 
 local browserPath = System.currentDirectory()
 if browserPath == nil or browserPath == "" then
     browserPath = "host:"
 end
 
+local currentEntries = {}
+local cursorIndex = 1
+local scrollOffset = 1
+local statusMessage = "Choose a mode."
+local selectedFolder = nil
+local currentModeIndex = 1
+local batchState = nil
+
+local MODES = {
+    {
+        key = "decode",
+        label = "Decode",
+        suffix = "_decrypted",
+        description = "Decrypt saved replay files.",
+    },
+    {
+        key = "replay",
+        label = "Encrypt as Replay",
+        suffix = "_replay",
+        description = "Encrypt decrypted replay into saved replay type",
+    },
+    {
+        key = "demo",
+        label = "Encrypt as Demo",
+        suffix = "_demo",
+        description = "Encrypt decrypted replay into Built-in Demo type",
+    },
+}
+
 local function trimTrailingSlash(path)
     if path == nil then
         return ""
     end
-
     if string.match(path, "^[^:]+:/$") then
         return path
     end
-
-    return (string.gsub(path, "/+$", ""))
+    return string.gsub(path, "/+$", "")
 end
 
 local function isRootPath(path)
     if path == nil then
         return true
     end
-
     return string.match(path, "^[^:]+:$") ~= nil or string.match(path, "^[^:]+:/$") ~= nil
 end
 
@@ -64,12 +88,10 @@ local function joinPath(base, name)
     if base == nil or base == "" then
         return name
     end
-
     local lastChar = string.sub(base, -1)
     if lastChar == "/" or lastChar == ":" then
         return base .. name
     end
-
     return base .. "/" .. name
 end
 
@@ -79,7 +101,6 @@ local function getParentPath(path)
     end
 
     local p = trimTrailingSlash(path)
-
     local deviceRoot = string.match(p, "^([^:]+:)[^/]+$")
     if deviceRoot then
         return deviceRoot
@@ -109,12 +130,6 @@ local function splitFileName(name)
     return name, ""
 end
 
-local function buildOutputName(inputPath)
-    local base = getBaseName(inputPath)
-    local stem, ext = splitFileName(base)
-    return stem .. "_processed" .. ext
-end
-
 local function readEntireFile(path)
     local fd = System.openFile(path, O_RDONLY)
     if fd == nil or fd < 0 then
@@ -127,14 +142,14 @@ local function readEntireFile(path)
         return nil, "Failed to read file size: " .. path
     end
 
-    local data, bytesRead = System.readFile(fd, size)
+    local data = System.readFile(fd, size)
     System.closeFile(fd)
 
     if data == nil then
         return nil, "Failed to read file data: " .. path
     end
 
-    return data, bytesRead or 0
+    return data, size
 end
 
 local function writeEntireFile(path, data)
@@ -153,9 +168,7 @@ local function writeEntireFile(path, data)
     return true, nil
 end
 
-
-
-local function safeWriteTextFile(path, text)
+local function writeTextFile(path, text)
     local fd = System.openFile(path, O_WRONLY | O_CREAT | O_TRUNC)
     if fd == nil or fd < 0 then
         return false
@@ -165,79 +178,60 @@ local function safeWriteTextFile(path, text)
     return true
 end
 
-local function processSelectedFile(inputPath, outputDir, inputData)
-    local outputData, replayInfo, err = GT4ReplayCrypto.decryptReplayString(inputData)
-    if not outputData then
-        return nil, nil, err or "Replay decode failed."
+local function ensureDirectory(path)
+    if doesFileExist(path) then
+        return true
     end
-
-    local base = getBaseName(inputPath)
-    local stem, ext = splitFileName(base)
-    local outputFileName = stem .. "_decoded" .. ext
-
-    local versionText = string.format("%d.%d", replayInfo.major_version, replayInfo.minor_version)
-    statusMessage = "Decoded replay version " .. versionText
-
-    return outputData, outputFileName, nil
+    local result = System.createDirectory(path)
+    return result == 0 or doesFileExist(path)
 end
 
-local function runSelectedJob()
-    if not selectedInputFile then
-        return false, "No input file selected."
-    end
-
-    if not selectedOutputDir then
-        return false, "No output folder selected."
-    end
-
-    local inputData, err = readEntireFile(selectedInputFile)
-    if not inputData then
-        return false, err
-    end
-
-    local outputData, outputName, processErr = processSelectedFile(selectedInputFile, selectedOutputDir, inputData)
-    if outputData == nil then
-        local debugPath = joinPath(selectedOutputDir or browserPath or "host:", "gt4_debug.txt")
-        local debugText = (processErr or "Processing failed.") .. "Input: " .. tostring(selectedInputFile) .. "OutputDir: " .. tostring(selectedOutputDir) .. "" safeWriteTextFile(debugPath, debugText)
-        return false, (processErr or "Processing failed.") .. " [debug saved: gt4_debug.txt]"
-    end
-
-    if outputName == nil or outputName == "" then
-        outputName = buildOutputName(selectedInputFile)
-    end
-
-    local outputPath = joinPath(selectedOutputDir, outputName)
-    local ok, writeErr = writeEntireFile(outputPath, outputData)
-    if not ok then
-        return false, writeErr
-    end
-
-    return true, "Done: " .. outputPath
+local function justPressed(currentPad, button)
+    return Pads.check(currentPad, button) and not Pads.check(previousPad, button)
 end
 
-local function refreshEntries()
-    local raw = System.listDirectory(browserPath) or {}
+local function drawText(x, y, scale, text, color)
+    Font.fmPrint(x, y, scale, text, color or WHITE)
+end
+
+local function drawBackground()
+    Screen.clear(BG)
+    Graphics.drawRect(10, 10, 620, 428, PANEL)
+    Graphics.drawRect(10, 10, 620, 34, Color.new(36, 48, 78))
+end
+
+local function currentMode()
+    return MODES[currentModeIndex]
+end
+
+local function getOutputFolderForMode(inputFolder, mode)
+    local parent = getParentPath(trimTrailingSlash(inputFolder))
+    local base = getBaseName(inputFolder)
+    return joinPath(parent, base .. mode.suffix)
+end
+
+local function listDirectoryEntries(path)
+    local raw = System.listDirectory(path) or {}
     local items = {}
 
-    if not isRootPath(browserPath) then
-        table.insert(items, {
+    if not isRootPath(path) then
+        items[#items + 1] = {
             name = "..",
             directory = true,
-            path = getParentPath(browserPath),
+            path = getParentPath(path),
             parent = true,
-        })
+        }
     end
 
     for i = 1, #raw do
         local entry = raw[i]
-        if entry.name ~= "." and entry.name ~= ".." then
-            table.insert(items, {
+        if entry.name ~= "." and entry.name ~= ".." and entry.directory == true then
+            items[#items + 1] = {
                 name = entry.name,
-                directory = entry.directory == true,
-                size = entry.size,
-                path = joinPath(browserPath, entry.name),
+                directory = true,
+                path = joinPath(path, entry.name),
                 parent = false,
-            })
+            }
         end
     end
 
@@ -245,190 +239,417 @@ local function refreshEntries()
         if a.parent ~= b.parent then
             return a.parent
         end
-        if a.directory ~= b.directory then
-            return a.directory
-        end
         return string.lower(a.name) < string.lower(b.name)
     end)
 
-    currentEntries = items
+    return items
+end
 
+local function countFilesInDirectory(path)
+    local raw = System.listDirectory(path) or {}
+    local count = 0
+    for i = 1, #raw do
+        local entry = raw[i]
+        if entry.name ~= "." and entry.name ~= ".." and entry.directory ~= true then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+local function refreshFolderEntries()
+    currentEntries = listDirectoryEntries(browserPath)
     if cursorIndex < 1 then
         cursorIndex = 1
     end
     if cursorIndex > #currentEntries then
-        cursorIndex = #currentEntries
+        cursorIndex = math.max(1, #currentEntries)
     end
-    if cursorIndex < 1 then
-        cursorIndex = 1
-    end
-end
-
-local function moveCursor(delta)
-    if #currentEntries == 0 then
-        cursorIndex = 1
-        return
-    end
-
-    cursorIndex = cursorIndex + delta
-    if cursorIndex < 1 then
-        cursorIndex = #currentEntries
-    elseif cursorIndex > #currentEntries then
-        cursorIndex = 1
+    if scrollOffset < 1 then
+        scrollOffset = 1
     end
 end
 
-local function wasPressed(now, button)
-    return (now & button) ~= 0 and (previousPad & button) == 0
-end
-
-local function enterDirectory(path)
-    browserPath = path
-    cursorIndex = 1
-    refreshEntries()
-end
-
-local function resetFlow()
-    stage = STAGE_SELECT_INPUT
-    selectedInputFile = nil
-    selectedOutputDir = nil
-    statusMessage = "Select an input file."
-    cursorIndex = 1
-    refreshEntries()
-end
-
-local function handleCross(entry)
-    if not entry then
-        return
+local function clampScroll()
+    local visibleCount = 14
+    if cursorIndex < scrollOffset then
+        scrollOffset = cursorIndex
+    elseif cursorIndex > scrollOffset + visibleCount - 1 then
+        scrollOffset = cursorIndex - visibleCount + 1
     end
 
-    if entry.directory then
-        enterDirectory(entry.path)
-        return
-    end
-
-    if stage == STAGE_SELECT_INPUT then
-        selectedInputFile = entry.path
-        selectedOutputDir = browserPath
-        stage = STAGE_SELECT_OUTPUT
-        statusMessage = "Input selected. Now choose an output folder and press START to decode."
-        refreshEntries()
-    else
-        statusMessage = "Select a folder for output. Press START to confirm the current folder."
+    if scrollOffset < 1 then
+        scrollOffset = 1
     end
 end
 
-local function handleCircle()
-    local parent = getParentPath(browserPath)
-    if parent ~= browserPath then
-        enterDirectory(parent)
+local function processFileByMode(modeKey, inputData)
+    if modeKey == "decode" then
+        return GT4ReplayCrypto.decryptReplayString(inputData)
+    elseif modeKey == "replay" then
+        return GT4ReplayCrypto.makeReplayPayloadString(inputData)
+    elseif modeKey == "demo" then
+        return GT4ReplayCrypto.makeDemoSerializeReplayString(inputData)
     end
+
+    return nil, nil, "Unknown mode."
 end
 
-local function handleStart()
-    if stage == STAGE_SELECT_OUTPUT then
-        selectedOutputDir = browserPath
-        local ok, resultMessage = runSelectedJob()
-        statusMessage = resultMessage
-        if ok then
-            stage = STAGE_DONE
-        end
-    elseif stage == STAGE_DONE then
-        resetFlow()
+local function formatVersion(info)
+    if info and info.serialize then
+        return string.format("%d.%d", info.serialize.major_version or 0, info.serialize.minor_version or 0)
     end
+    return "?.?"
 end
 
-local function drawLine(y, text, color)
-    Font.fmPrint(20, y, 0.45, text, color or WHITE)
+local function buildOutputName(modeKey, sourceName)
+    local stem, ext = splitFileName(sourceName)
+
+    if modeKey == "decode" then
+        return stem .. "_decrypted" .. ext
+    elseif modeKey == "replay" then
+        return stem .. "_replay" .. ext
+    elseif modeKey == "demo" then
+        return stem .. "_demo" .. ext
+    end
+
+    return sourceName
 end
 
-local function formatEntry(entry)
-    if entry.directory then
-        return "[DIR] " .. entry.name
-    end
+local function beginBatch(folderPath)
+    local mode = currentMode()
+    local raw = System.listDirectory(folderPath) or {}
+    local files = {}
 
-    if entry.size ~= nil then
-        return string.format("[FILE] %s (%d bytes)", entry.name, entry.size)
-    end
-
-    return "[FILE] " .. entry.name
-end
-
-local function drawUI()
-    Screen.clear(Color.new(20, 24, 30))
-
-    drawLine(20, "Enceladus GT4 Replay Decoder", YELLOW)
-    drawLine(44, "Path: " .. browserPath, GRAY)
-
-    if stage == STAGE_SELECT_INPUT then
-        drawLine(68, "Step 1: Choose input file with CROSS", GREEN)
-    elseif stage == STAGE_SELECT_OUTPUT then
-        drawLine(68, "Step 2: Choose output folder, then press START to decode", GREEN)
-    else
-        drawLine(68, "Completed. Press START to begin another job", GREEN)
-    end
-
-    drawLine(92, "Input:  " .. (selectedInputFile or "<none>"), WHITE)
-    drawLine(112, "Output: " .. (selectedOutputDir or "<none>"), WHITE)
-    drawLine(132, statusMessage, YELLOW)
-
-    local startY = 168
-    local maxRows = 11
-    local firstRow = 1
-
-    if cursorIndex > maxRows then
-        firstRow = cursorIndex - maxRows + 1
-    end
-
-    if #currentEntries == 0 then
-        drawLine(startY, "<empty directory>", RED)
-    else
-        for row = 0, maxRows - 1 do
-            local index = firstRow + row
-            local entry = currentEntries[index]
-            if entry then
-                local prefix = (index == cursorIndex) and "> " or "  "
-                local color = (index == cursorIndex) and GREEN or WHITE
-                drawLine(startY + row * 20, prefix .. formatEntry(entry), color)
-            end
+    for i = 1, #raw do
+        local entry = raw[i]
+        if entry.name ~= "." and entry.name ~= ".." and entry.directory ~= true then
+            files[#files + 1] = {
+                name = entry.name,
+                path = joinPath(folderPath, entry.name),
+            }
         end
     end
 
-    drawLine(396, "UP/DOWN Move   CROSS Enter/Select   CIRCLE Up   START Confirm   TRIANGLE Exit", GRAY)
-    Screen.flip()
+    table.sort(files, function(a, b)
+        return string.lower(a.name) < string.lower(b.name)
+    end)
+
+    local outputDir = getOutputFolderForMode(folderPath, mode)
+    if not ensureDirectory(outputDir) then
+        statusMessage = "Failed to create output folder: " .. outputDir
+        return false
+    end
+
+    batchState = {
+        mode = mode,
+        inputDir = folderPath,
+        outputDir = outputDir,
+        files = files,
+        index = 1,
+        success = 0,
+        failed = 0,
+        skipped = 0,
+        logLines = {},
+        lastResult = "",
+    }
+
+    selectedFolder = folderPath
+    state = STATE_RUN
+
+    if #files == 0 then
+        batchState.lastResult = "No files found in folder."
+    else
+        batchState.lastResult = "Starting batch..."
+    end
+
+    return true
 end
 
-refreshEntries()
-
-while true do
-    local pad = Pads.get(0)
-
-    if wasPressed(pad, PAD_UP) then
-        moveCursor(-1)
+local function writeBatchLog()
+    if not batchState then
+        return
     end
 
-    if wasPressed(pad, PAD_DOWN) then
-        moveCursor(1)
+    local lines = {}
+    lines[#lines + 1] = "Mode: " .. tostring(batchState.mode.label)
+    lines[#lines + 1] = "InputDir: " .. tostring(batchState.inputDir)
+    lines[#lines + 1] = "OutputDir: " .. tostring(batchState.outputDir)
+    lines[#lines + 1] = string.format("Success: %d", batchState.success)
+    lines[#lines + 1] = string.format("Failed: %d", batchState.failed)
+    lines[#lines + 1] = string.format("Skipped: %d", batchState.skipped)
+    lines[#lines + 1] = ""
+
+    for i = 1, #batchState.logLines do
+        lines[#lines + 1] = batchState.logLines[i]
     end
 
-    if wasPressed(pad, PAD_CROSS) then
-        handleCross(currentEntries[cursorIndex])
+    writeTextFile(joinPath(batchState.outputDir, "batch_log.txt"), table.concat(lines, "\n"))
+end
+
+local function finishBatch()
+    writeBatchLog()
+    state = STATE_DONE
+    if batchState.failed == 0 then
+        statusMessage = string.format(
+            "%s finished. %d files written to %s",
+            batchState.mode.label,
+            batchState.success,
+            batchState.outputDir
+        )
+    else
+        statusMessage = string.format(
+            "%s finished. %d ok, %d failed. See batch_log.txt",
+            batchState.mode.label,
+            batchState.success,
+            batchState.failed
+        )
+    end
+end
+
+local function processNextBatchItem()
+    if not batchState then
+        return
     end
 
-    if wasPressed(pad, PAD_CIRCLE) then
-        handleCircle()
+    if batchState.index > #batchState.files then
+        finishBatch()
+        return
     end
 
-    if wasPressed(pad, PAD_START) then
-        handleStart()
+    local item = batchState.files[batchState.index]
+    local outputName = buildOutputName(batchState.mode.key, item.name)
+    local outputPath = joinPath(batchState.outputDir, outputName)
+
+    local inputData, readErr = readEntireFile(item.path)
+    if not inputData then
+        batchState.failed = batchState.failed + 1
+        batchState.logLines[#batchState.logLines + 1] = "[FAIL] " .. item.name .. " - " .. tostring(readErr)
+        batchState.lastResult = "Failed: " .. item.name
+        batchState.index = batchState.index + 1
+        return
     end
 
-    if wasPressed(pad, PAD_TRIANGLE) then
-        Font.fmUnload()
+    local outputData, info, processErr = processFileByMode(batchState.mode.key, inputData)
+    if not outputData then
+        batchState.failed = batchState.failed + 1
+        batchState.logLines[#batchState.logLines + 1] = "[FAIL] " .. item.name .. " - " .. tostring(processErr)
+        batchState.lastResult = "Failed: " .. item.name
+        batchState.index = batchState.index + 1
+        return
+    end
+
+    local ok, writeErr = writeEntireFile(outputPath, outputData)
+    if not ok then
+        batchState.failed = batchState.failed + 1
+        batchState.logLines[#batchState.logLines + 1] = "[FAIL] " .. item.name .. " - " .. tostring(writeErr)
+        batchState.lastResult = "Failed write: " .. item.name
+        batchState.index = batchState.index + 1
+        return
+    end
+
+    batchState.success = batchState.success + 1
+    batchState.logLines[#batchState.logLines + 1] = string.format(
+        "[OK] %s -> %s | version=%s | %s -> %s",
+        item.name,
+        outputName,
+        formatVersion(info),
+        tostring(info and info.input_layout or "unknown"),
+        tostring(info and info.output_layout or "unknown")
+    )
+    batchState.lastResult = "Processed: " .. item.name
+    batchState.index = batchState.index + 1
+end
+
+local function updateModeInput(currentPad)
+    if justPressed(currentPad, PAD_UP) then
+        currentModeIndex = currentModeIndex - 1
+        if currentModeIndex < 1 then
+            currentModeIndex = #MODES
+        end
+    elseif justPressed(currentPad, PAD_DOWN) then
+        currentModeIndex = currentModeIndex + 1
+        if currentModeIndex > #MODES then
+            currentModeIndex = 1
+        end
+    elseif justPressed(currentPad, PAD_CROSS) then
+        state = STATE_FOLDER
+        browserPath = System.currentDirectory() or browserPath
+        refreshFolderEntries()
+        statusMessage = "Browse to a folder, then press START to batch process it."
+    elseif justPressed(currentPad, PAD_TRIANGLE) then
+        System.exitToBrowser()
+    end
+end
+
+local function updateFolderInput(currentPad)
+    if justPressed(currentPad, PAD_UP) then
+        cursorIndex = cursorIndex - 1
+        if cursorIndex < 1 then
+            cursorIndex = math.max(1, #currentEntries)
+        end
+    elseif justPressed(currentPad, PAD_DOWN) then
+        cursorIndex = cursorIndex + 1
+        if cursorIndex > #currentEntries then
+            cursorIndex = 1
+        end
+    elseif justPressed(currentPad, PAD_CROSS) then
+        local entry = currentEntries[cursorIndex]
+        if entry and entry.directory then
+            browserPath = entry.path
+            cursorIndex = 1
+            scrollOffset = 1
+            refreshFolderEntries()
+        end
+    elseif justPressed(currentPad, PAD_CIRCLE) then
+        browserPath = getParentPath(browserPath)
+        cursorIndex = 1
+        scrollOffset = 1
+        refreshFolderEntries()
+    elseif justPressed(currentPad, PAD_START) then
+        beginBatch(browserPath)
+    elseif justPressed(currentPad, PAD_SELECT) then
+        state = STATE_MODE
+        statusMessage = "Choose a mode."
+    elseif justPressed(currentPad, PAD_TRIANGLE) then
         System.exitToBrowser()
     end
 
-    drawUI()
+    clampScroll()
+end
+
+local function updateRunInput(currentPad)
+    if justPressed(currentPad, PAD_TRIANGLE) then
+        System.exitToBrowser()
+        return
+    end
+
+    processNextBatchItem()
+end
+
+local function updateDoneInput(currentPad)
+    if justPressed(currentPad, PAD_CROSS) then
+        state = STATE_FOLDER
+        statusMessage = "Browse to another folder, then press START to batch process it."
+        refreshFolderEntries()
+    elseif justPressed(currentPad, PAD_SELECT) then
+        state = STATE_MODE
+        statusMessage = "Choose a mode."
+    elseif justPressed(currentPad, PAD_TRIANGLE) then
+        System.exitToBrowser()
+    end
+end
+
+local function drawModeScreen()
+    local mode = currentMode()
+
+    drawText(20, 18, 0.8, "GT4 Replay Batch Tool", WHITE)
+    drawText(20, 42, 0.6, "Choose operation", CYAN)
+
+    local y = 86
+    for i = 1, #MODES do
+        local item = MODES[i]
+        local color = (i == currentModeIndex) and GREEN or WHITE
+        local prefix = (i == currentModeIndex) and "> " or "  "
+        drawText(32, y, 0.55, prefix .. item.label, color)
+        y = y + 26
+    end
+
+    drawText(20, 196, 0.5, mode.description, YELLOW)
+    drawText(20, 226, 0.5, "Outputs to: [folder name]" .. mode.suffix, GRAY)
+
+    drawText(20, 382, 0.45, "UP/DOWN = choose  CROSS = continue  TRIANGLE = exit", GRAY)
+    drawText(20, 404, 0.45, statusMessage, WHITE)
+end
+
+local function drawFolderScreen()
+    local mode = currentMode()
+    local outputDir = getOutputFolderForMode(browserPath, mode)
+    local fileCount = countFilesInDirectory(browserPath)
+
+    drawText(20, 18, 0.8, "GT4 Replay Batch Tool", WHITE)
+    drawText(20, 42, 0.55, "Mode: " .. mode.label, CYAN)
+    drawText(20, 64, 0.45, "Current folder: " .. browserPath, GRAY)
+    drawText(20, 84, 0.45, "Files to process: " .. tostring(fileCount), GRAY)
+    drawText(20, 104, 0.45, "Output folder: " .. outputDir, YELLOW)
+
+    local startY = 136
+    local visibleCount = 14
+    for row = 0, visibleCount - 1 do
+        local index = scrollOffset + row
+        local entry = currentEntries[index]
+        if entry then
+            local color = (index == cursorIndex) and GREEN or WHITE
+            local prefix = entry.parent and "[..] " or "[DIR] "
+            drawText(36, startY + row * 20, 0.45, prefix .. entry.name, color)
+        end
+    end
+
+    drawText(20, 382, 0.45, "CROSS = open folder  CIRCLE = parent  START = use current folder", GRAY)
+    drawText(20, 402, 0.45, "SELECT = mode menu  TRIANGLE = exit", GRAY)
+    drawText(20, 422, 0.45, statusMessage, WHITE)
+end
+
+local function drawRunScreen()
+    local total = 0
+    local current = 0
+    if batchState then
+        total = #batchState.files
+        current = math.min(batchState.index, total)
+    end
+
+    drawText(20, 18, 0.8, "GT4 Replay Batch Tool", WHITE)
+    drawText(20, 42, 0.55, "Running: " .. tostring(batchState and batchState.mode.label or ""), CYAN)
+    drawText(20, 66, 0.45, "Input: " .. tostring(batchState and batchState.inputDir or ""), GRAY)
+    drawText(20, 86, 0.45, "Output: " .. tostring(batchState and batchState.outputDir or ""), YELLOW)
+
+    drawText(20, 136, 0.55, string.format("Progress: %d / %d", current, total), WHITE)
+    drawText(20, 164, 0.5, "Success: " .. tostring(batchState and batchState.success or 0), GREEN)
+    drawText(20, 186, 0.5, "Failed: " .. tostring(batchState and batchState.failed or 0), RED)
+    drawText(20, 208, 0.5, "Last: " .. tostring(batchState and batchState.lastResult or ""), WHITE)
+
+    drawText(20, 392, 0.45, "Please keep this screen open while files are processed.", GRAY)
+    drawText(20, 414, 0.45, "TRIANGLE = exit", GRAY)
+end
+
+local function drawDoneScreen()
+    drawText(20, 18, 0.8, "GT4 Replay Tool", WHITE)
+    drawText(20, 42, 0.55, "Finished: " .. tostring(batchState and batchState.mode.label or ""), CYAN)
+
+    if batchState then
+        drawText(20, 86, 0.5, "Input folder: " .. batchState.inputDir, GRAY)
+        drawText(20, 108, 0.5, "Output folder: " .. batchState.outputDir, YELLOW)
+        drawText(20, 152, 0.55, "Success: " .. tostring(batchState.success), GREEN)
+        drawText(20, 176, 0.55, "Failed: " .. tostring(batchState.failed), RED)
+        drawText(20, 200, 0.55, "Skipped: " .. tostring(batchState.skipped), WHITE)
+        drawText(20, 224, 0.5, "Log saved as batch_log.txt", GRAY)
+    end
+
+    drawText(20, 382, 0.45, "CROSS = choose another folder  SELECT = change mode  TRIANGLE = exit", GRAY)
+    drawText(20, 404, 0.45, statusMessage, WHITE)
+end
+
+refreshFolderEntries()
+
+while true do
+    local currentPad = Pads.get()
+
+    drawBackground()
+    if state == STATE_MODE then
+        updateModeInput(currentPad)
+        drawModeScreen()
+    elseif state == STATE_FOLDER then
+        updateFolderInput(currentPad)
+        drawFolderScreen()
+    elseif state == STATE_RUN then
+        updateRunInput(currentPad)
+        drawRunScreen()
+    elseif state == STATE_DONE then
+        updateDoneInput(currentPad)
+        drawDoneScreen()
+    end
+
+    Screen.flip()
     Screen.waitVblankStart()
-    previousPad = pad
+    previousPad = currentPad
 end
