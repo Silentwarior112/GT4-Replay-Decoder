@@ -51,19 +51,19 @@ local MODES = {
         key = "decode",
         label = "Decode",
         suffix = "_decrypted",
-        description = "Decrypt saved replay files.",
+        description = "Decode replay files into decrypted wrapped files.",
     },
     {
         key = "replay",
-        label = "Encrypt as Replay",
+        label = "Encode Replay",
         suffix = "_replay",
-        description = "Encrypt decrypted replay into saved replay type",
+        description = "Encode decrypted files into replay payload files without the 0x40 header.",
     },
     {
         key = "demo",
-        label = "Encrypt as Demo",
+        label = "Encode Demo",
         suffix = "_demo",
-        description = "Encrypt decrypted replay into Built-in Demo type",
+        description = "Encode decrypted files into demo files that start with the 0x40 header.",
     },
 }
 
@@ -245,12 +245,20 @@ local function listDirectoryEntries(path)
     return items
 end
 
+
+local function shouldSkipFile(name)
+    if name == nil then
+        return true
+    end
+    return string.lower(name) == "batch_log.txt"
+end
+
 local function countFilesInDirectory(path)
     local raw = System.listDirectory(path) or {}
     local count = 0
     for i = 1, #raw do
         local entry = raw[i]
-        if entry.name ~= "." and entry.name ~= ".." and entry.directory ~= true then
+        if entry.name ~= "." and entry.name ~= ".." and entry.directory ~= true and not shouldSkipFile(entry.name) then
             count = count + 1
         end
     end
@@ -303,16 +311,6 @@ local function formatVersion(info)
 end
 
 local function buildOutputName(modeKey, sourceName)
-    local stem, ext = splitFileName(sourceName)
-
-    if modeKey == "decode" then
-        return stem .. "_decrypted" .. ext
-    elseif modeKey == "replay" then
-        return stem .. "_replay" .. ext
-    elseif modeKey == "demo" then
-        return stem .. "_demo" .. ext
-    end
-
     return sourceName
 end
 
@@ -323,7 +321,7 @@ local function beginBatch(folderPath)
 
     for i = 1, #raw do
         local entry = raw[i]
-        if entry.name ~= "." and entry.name ~= ".." and entry.directory ~= true then
+        if entry.name ~= "." and entry.name ~= ".." and entry.directory ~= true and not shouldSkipFile(entry.name) then
             files[#files + 1] = {
                 name = entry.name,
                 path = joinPath(folderPath, entry.name),
@@ -543,7 +541,7 @@ end
 local function drawModeScreen()
     local mode = currentMode()
 
-    drawText(20, 18, 0.8, "GT4 Replay Tool", WHITE)
+    drawText(20, 18, 0.8, "GT4 Replay Batch Tool", WHITE)
     drawText(20, 42, 0.6, "Choose operation", CYAN)
 
     local y = 86
@@ -556,7 +554,7 @@ local function drawModeScreen()
     end
 
     drawText(20, 196, 0.5, mode.description, YELLOW)
-    drawText(20, 226, 0.5, "Outputs to: [folder name]" .. mode.suffix, GRAY)
+    drawText(20, 226, 0.5, "Output folder suffix: " .. mode.suffix, GRAY)
 
     drawText(20, 382, 0.45, "UP/DOWN = choose  CROSS = continue  TRIANGLE = exit", GRAY)
     drawText(20, 404, 0.45, statusMessage, WHITE)
@@ -567,7 +565,7 @@ local function drawFolderScreen()
     local outputDir = getOutputFolderForMode(browserPath, mode)
     local fileCount = countFilesInDirectory(browserPath)
 
-    drawText(20, 18, 0.8, "GT4 Replay Tool", WHITE)
+    drawText(20, 18, 0.8, "GT4 Replay Batch Tool", WHITE)
     drawText(20, 42, 0.55, "Mode: " .. mode.label, CYAN)
     drawText(20, 64, 0.45, "Current folder: " .. browserPath, GRAY)
     drawText(20, 84, 0.45, "Files to process: " .. tostring(fileCount), GRAY)
@@ -598,7 +596,7 @@ local function drawRunScreen()
         current = math.min(batchState.index, total)
     end
 
-    drawText(20, 18, 0.8, "GT4 Replay Tool", WHITE)
+    drawText(20, 18, 0.8, "GT4 Replay Batch Tool", WHITE)
     drawText(20, 42, 0.55, "Running: " .. tostring(batchState and batchState.mode.label or ""), CYAN)
     drawText(20, 66, 0.45, "Input: " .. tostring(batchState and batchState.inputDir or ""), GRAY)
     drawText(20, 86, 0.45, "Output: " .. tostring(batchState and batchState.outputDir or ""), YELLOW)
@@ -613,7 +611,7 @@ local function drawRunScreen()
 end
 
 local function drawDoneScreen()
-    drawText(20, 18, 0.8, "GT4 Replay Tool", WHITE)
+    drawText(20, 18, 0.8, "GT4 Replay Batch Tool", WHITE)
     drawText(20, 42, 0.55, "Finished: " .. tostring(batchState and batchState.mode.label or ""), CYAN)
 
     if batchState then
