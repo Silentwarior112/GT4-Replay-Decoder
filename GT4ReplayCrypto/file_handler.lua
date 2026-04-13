@@ -51,19 +51,19 @@ local MODES = {
         key = "decode",
         label = "Decode",
         suffix = "_decrypted",
-        description = "Decode replay files into decrypted wrapped files.",
+        description = "Decode saved replay files",
     },
     {
         key = "replay",
         label = "Encode Replay",
         suffix = "_replay",
-        description = "Encode decrypted files into replay payload files without the 0x40 header.",
+        description = "Encode decrypted replay into replay as saved type",
     },
     {
         key = "demo",
         label = "Encode Demo",
         suffix = "_demo",
-        description = "Encode decrypted files into demo files that start with the 0x40 header.",
+        description = "Encode decrypted replay into replay as demo type",
     },
 }
 
